@@ -1251,6 +1251,7 @@ class GGUFModelLoader(BaseModelLoader):
             model.load_weights(
                 self._get_weights_iterator(local_model_path, gguf_weights_map))
         return model
+
 try:
     from runai_model_streamer import SafetensorsStreamer
 except ImportError:
@@ -1266,7 +1267,7 @@ class RunAIStreamerLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
-        self.concurrency = os.environ.get("RUNAI_STREAMER_CONCURRENCY", None)
+        self.concurrency = os.environ.get("RUNAI_STREAMER_CONCURRENCY", 20)
         self.memory_limit = os.environ.get("RUNAI_STREAMER_MEMORY_LIMIT", "-1")
         
         # Handle extra config if provided
@@ -1291,20 +1292,19 @@ class RunAIStreamerLoader(BaseModelLoader):
             os.environ["RUNAI_STREAMER_CONCURRENCY"] = str(self.concurrency)
         os.environ["RUNAI_STREAMER_MEMORY_LIMIT"] = str(self.memory_limit)
 
-    def _get_model_path(self, model_config: ModelConfig) -> str:
-        """Get the path to the model file."""
+    def _get_model_path(self, model_config: ModelConfig) -> List[str]:
+        """Get the path(s) to the model file(s)."""
         model_path = model_config.model
         
         # If it's an S3 path, return directly
         if model_path.startswith("s3://"):
-            return model_path
+            return [model_path]
             
         # If it's a local file, return the path
         if os.path.isfile(model_path):
-            return model_path
+            return [model_path]
         
         # If it's a HuggingFace model, download it first
-        # Use vLLM's existing download functionality
         hf_folder = download_weights_from_hf(
             model_name_or_path=model_path,
             cache_dir=self.load_config.download_dir,
@@ -1313,24 +1313,40 @@ class RunAIStreamerLoader(BaseModelLoader):
             ignore_patterns=self.load_config.ignore_patterns,
         )
         
-        # Find the safetensors file
+        # Find all safetensors files
         safetensors_files = glob.glob(os.path.join(hf_folder, "*.safetensors"))
         if not safetensors_files:
             raise ValueError(f"No safetensors file found in {hf_folder}")
         
-        return safetensors_files[0]
+        # Sort files to ensure consistent order
+        safetensors_files.sort()
+        
+        # For models like Mistral with both sharded and consolidated files
+        # filter duplicates using vLLM's utility
+        if len(safetensors_files) > 1:
+            consolidated_files = filter_duplicate_safetensors_files(
+                safetensors_files, 
+                hf_folder, 
+                SAFE_WEIGHTS_INDEX_NAME
+            )
+            if consolidated_files:
+                safetensors_files = consolidated_files
+                
+        return safetensors_files
 
     def _get_weights_iterator(
-        self, model_path: str
+        self, model_paths: List[str]
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-        """Stream weights from the model file."""
-        with SafetensorsStreamer() as streamer:
-            streamer.stream_file(model_path)
-            for name, tensor in streamer.get_tensors():
-                # Clone tensor to keep it in CPU memory if needed
-                if self.memory_limit != "-1":
-                    tensor = tensor.clone()
-                yield name, tensor
+        """Stream weights from the model file(s)."""
+        from runai_model_streamer import SafetensorsStreamer
+        for model_path in model_paths:
+            with SafetensorsStreamer() as streamer:
+                streamer.stream_file(model_path)
+                for name, tensor in streamer.get_tensors():
+                    # Clone tensor to keep it in CPU memory if needed
+                    if self.memory_limit != "-1":
+                        tensor = tensor.clone()
+                    yield name, tensor
 
     def download_model(self, model_config: ModelConfig) -> None:
         """Verify model path exists but don't download since streaming handles it."""
@@ -1347,7 +1363,6 @@ class RunAIStreamerLoader(BaseModelLoader):
         scheduler_config: Optional[SchedulerConfig] = None
     ) -> nn.Module:
         """Initialize the model architecture."""
-        # from vllm.model_executor.model_loader.model_loader import _initialize_model
         return _initialize_model(
             model_config=model_config,
             load_config=self.load_config,
@@ -1367,11 +1382,9 @@ class RunAIStreamerLoader(BaseModelLoader):
         cache_config: CacheConfig
     ) -> nn.Module:
         """Load a model using Run:ai Model Streamer."""
-        # from vllm.model_executor.utils import set_default_torch_dtype
-        
-        # Get model path
-        model_path = self._get_model_path(model_config)
-        logger.info(f"Loading model from {model_path} using Run:ai Model Streamer")
+        # Get model paths
+        model_paths = self._get_model_path(model_config)
+        logger.info(f"Loading model from {len(model_paths)} files using Run:ai Model Streamer")
         
         # Initialize model
         with set_default_torch_dtype(model_config.dtype):
@@ -1382,18 +1395,24 @@ class RunAIStreamerLoader(BaseModelLoader):
                     cache_config=cache_config,
                     scheduler_config=scheduler_config
                 )
-            # Load weights
-            model.load_weights(self._get_weights_iterator(model_path))
+                
+            # Load weights from all files
+            model.load_weights(self._get_weights_iterator(model_paths))
             
             # Process quantization if needed
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
-                    # from vllm.model_executor.model_loader.model_loader import device_loading_context
                     with device_loading_context(module, torch.device(device_config.device)):
                         quant_method.process_weights_after_loading(module)
                         
         return model.eval()
+
+
+
+
+
+
 
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     """Get a model loader based on the load format."""
